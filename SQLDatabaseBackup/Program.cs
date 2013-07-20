@@ -1,7 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Data.SqlClient;
+using System.Diagnostics;
 using System.Linq;
+using System.Threading;
+using System.Windows.Forms;
 
 namespace Two10.SQLDatabaseBackup
 {
@@ -10,9 +13,14 @@ namespace Two10.SQLDatabaseBackup
 
         static void Main(string[] args)
         {
-            if (args.Length == 0)
+            try
             {
-                Console.WriteLine(@"
+                Application.ThreadException += new ThreadExceptionEventHandler(Application_ThreadException);
+                AppDomain.CurrentDomain.UnhandledException += new UnhandledExceptionEventHandler(CurrentDomain_UnhandledException);
+                
+                if (args.Length == 0)
+                {
+                    Console.WriteLine(@"
 Windows Azure SQL Database Copy Utility
 
 This utility will take a copy of your SQL Database, and once the copy has completed, will make a backup of the database to blob storage using the bacpac format.
@@ -43,60 +51,92 @@ SQLDatabaseBackup.exe
     -datacenter eastasia
     -cleanup
 ");
-                return;
-            }
+                    return;
+                }
 
-            if (!CheckSwitches("-server", "-database", "-user", "-pwd", "-storagename", "-storagekey", "-datacenter"))
-            {
-                return;
-            }
+                if (!CheckSwitches("-server", "-database", "-user", "-pwd", "-storagename", "-storagekey", "-datacenter"))
+                {
+                    return;
+                }
 
-            var server = GetSwitch("-server");         // i.e. the first part of xxx.database.windows.net
-            var database = GetSwitch("-database");     // name of the database you want to back up
-            var backupDatabase = database + "_copy";         // name for the backup database (it will create)
-            if (GetSwitch("-databasecopy") != null)
-            {
-                backupDatabase = GetSwitch("-databasecopy");
-            }
-            var username = GetSwitch("-user");           // database username
-            var password = GetSwitch("-pwd");            // database password
-            var blobAccount = GetSwitch("-storagename"); // storage account
-            var blobKey = GetSwitch("-storagekey");     // storage key
-            var container = "sqlbackup";
-            if (GetSwitch("-container") != null)
-            {
-                container = GetSwitch("-container");
-            }
+                var server = GetSwitch("-server");         // i.e. the first part of xxx.database.windows.net
+                var database = GetSwitch("-database");     // name of the database you want to back up
+                var backupDatabase = database + "_copy";         // name for the backup database (it will create)
+                if (GetSwitch("-databasecopy") != null)
+                {
+                    backupDatabase = GetSwitch("-databasecopy");
+                }
+                var username = GetSwitch("-user");           // database username
+                var password = GetSwitch("-pwd");            // database password
+                var blobAccount = GetSwitch("-storagename"); // storage account
+                var blobKey = GetSwitch("-storagekey");     // storage key
+                var container = "sqlbackup";
+                if (GetSwitch("-container") != null)
+                {
+                    container = GetSwitch("-container");
+                }
 
-            var dataCenterUri = ResolveUri(GetSwitch("-datacenter"));
-            if (string.IsNullOrWhiteSpace(dataCenterUri))
-            {
-                return;
-            }
+                var dataCenterUri = ResolveUri(GetSwitch("-datacenter"));
+                if (string.IsNullOrWhiteSpace(dataCenterUri))
+                {
+                    return;
+                }
 
-            using (var copier = new DatabaseCopier(CreateConnection(server, username, password)))
-            {
-                copier.Copy(database, backupDatabase);
-            }
-
-            var blobName = database + "-backup-" + DateTime.UtcNow.ToString("yyyy-MM-dd_hh-mm");
-
-            var exporter = new DatabaseExporter(server + ".database.windows.net", backupDatabase, username, password, string.Format("https://{0}.blob.core.windows.net/{1}/{2}.bacpac", blobAccount, container, blobName), blobKey, dataCenterUri);
-            exporter.Export();
-
-            if (Environment.GetCommandLineArgs().Contains("-cleanup") &&
-                //be extra careful
-                !backupDatabase.Equals(database, StringComparison.CurrentCultureIgnoreCase))
-            {
                 using (var copier = new DatabaseCopier(CreateConnection(server, username, password)))
                 {
-                    copier.DropDatabase(backupDatabase);
+                    copier.Copy(database, backupDatabase);
                 }
-            }
 
-            Console.WriteLine("Database backed up to {0}/{1}", container, blobName);
+                var blobName = database + "-backup-" + DateTime.UtcNow.ToString("yyyy-MM-dd_hh-mm");
+
+                var exporter = new DatabaseExporter(server + ".database.windows.net", backupDatabase, username, password, string.Format("https://{0}.blob.core.windows.net/{1}/{2}.bacpac", blobAccount, container, blobName), blobKey, dataCenterUri);
+                exporter.Export();
+
+                if (Environment.GetCommandLineArgs().Contains("-cleanup") &&
+                    //be extra careful
+                    !backupDatabase.Equals(database, StringComparison.CurrentCultureIgnoreCase))
+                {
+                    using (var copier = new DatabaseCopier(CreateConnection(server, username, password)))
+                    {
+                        copier.DropDatabase(backupDatabase);
+                    }
+                }
+
+                Console.WriteLine("Database backed up to {0}/{1}", container, blobName);
+            }
+            catch (Exception e)
+            {
+                HandleException(e.ToString());
+                throw; // empty Throw for Vista WER [Windows Error Reporting]
+            }
         }
 
+        private static void Application_ThreadException(object sender, ThreadExceptionEventArgs e)
+        {
+            HandleException(e.Exception.ToString());
+        }
+
+        private static void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
+        {
+            HandleException((e.ExceptionObject as Exception).ToString());
+        }
+
+        private static void HandleException(string exceptionMessage)
+        {
+#if DEBUG
+            Debug.WriteLine("Main exception: " + exceptionMessage);
+            Console.WriteLine("Main exception: " + exceptionMessage);
+#endif
+            LogMessageToWindows(EventLogEntryType.Error, exceptionMessage);
+        }
+
+        private static void LogMessageToWindows(EventLogEntryType eventType, string eventText)
+        {
+            if (!EventLog.SourceExists(Application.ProductName))
+                EventLog.CreateEventSource(Application.ProductName, "Application");
+
+            EventLog.WriteEntry(Application.ProductName, eventText, eventType);
+        }
 
         private static SqlConnection CreateConnection(string server, string username, string password)
         {
